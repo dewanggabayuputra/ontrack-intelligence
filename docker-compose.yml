@@ -1,0 +1,79 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: ontrack_postgres
+    environment:
+      POSTGRES_USER: ontrack_user
+      POSTGRES_PASSWORD: ontrack_password
+      POSTGRES_DB: ontrack_db
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ontrack_user -d ontrack_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ontrack_network
+
+  # Backend API (NestJS)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ontrack_backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://ontrack_user:ontrack_password@postgres:5432/ontrack_db
+      JWT_SECRET: your_jwt_secret_key_here_change_in_production
+      PORT: 3001
+      DATA_DICTIONARY_DIR: /app/uploads/data-dictionaries
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend/src:/app/src
+      - backend_node_modules:/app/node_modules
+      - data_dictionary_files:/app/uploads/data-dictionaries
+    command: sh -c "npx prisma db push && npx ts-node --transpile-only -r tsconfig-paths/register src/main.ts"
+    networks:
+      - ontrack_network
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ontrack_frontend
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:3001/api/v1
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend/src:/app/src
+      - frontend_node_modules:/app/node_modules
+    command: npm run dev
+    networks:
+      - ontrack_network
+
+volumes:
+  postgres_data:
+    driver: local
+  backend_node_modules:
+    driver: local
+  data_dictionary_files:
+    driver: local
+  frontend_node_modules:
+    driver: local
+
+networks:
+  ontrack_network:
+    driver: bridge

@@ -1,0 +1,374 @@
+// ============================================================================
+// Prisma Schema for OnTrack Project Intelligence System
+// Supports: Project Master CSV, Project Updates CSV, Production Data JSON
+// Database: PostgreSQL 14+
+// Prisma: v6.x
+// ============================================================================
+// DESIGN PRINCIPLES:
+// 1. UUID as internal primary key for relational integrity
+// 2. Source IDs preserved with unique constraints for idempotency
+// 3. Foreign keys use UUID (internal ID) not source ID
+// 4. Historical data preservation (assessments, follow-up history)
+// 5. Evidence traceability (all findings reference sources)
+// 6. Polymorphic payloads stored as JSON (production records)
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// ENUMS - Type Safety
+// ============================================================================
+
+enum HealthStatus {
+  HEALTHY
+  AT_RISK
+  NEEDS_ATTENTION
+  INSUFFICIENT_DATA
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum Confidence {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum FollowUpStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  // Retained for compatibility with existing application data and clients.
+  CLOSED
+  CANCELLED
+}
+
+enum ImportStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum RecordType {
+  DEPLOYMENT
+  INCIDENT
+  PERFORMANCE
+  OPERATIONAL
+  CUSTOM
+}
+
+// ============================================================================
+// PROJECTS MODULE
+// From: Project Master CSV
+// Fields: project_id, customer, project_name, project_type, pic, start_date,
+//         deadline, target, target_unit, reported_actual, 
+//         reported_progress_pct, reported_status, last_reported_update_at
+// ============================================================================
+
+model Project {
+  id String @id @default(uuid())
+
+  // Source identifiers (unique for idempotency)
+  projectId String @unique @map("project_id")
+
+  // Project master data from CSV
+  customer    String?
+  projectName String  @map("project_name")
+  projectType String? @map("project_type")
+  pic         String? // Person In Charge
+
+  // Schedule
+  startDate DateTime? @map("start_date")
+  deadline  DateTime? @map("deadline")
+
+  // Target & Progress
+  target              String?
+  targetUnit          String?  @map("target_unit")
+  reportedActual      Decimal? @map("reported_actual") @db.Decimal(15, 4)
+  reportedProgressPct Decimal? @map("reported_progress_pct") @db.Decimal(5, 2)
+
+  // Status
+  reportedStatus       String?   @map("reported_status")
+  lastReportedUpdateAt DateTime? @map("last_reported_update_at")
+
+  // Metadata
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relationships
+  updates           ProjectUpdate[]
+  productionRecords ProductionRecord[]
+  assessments       ProjectAssessment[]
+  followUps         FollowUp[]
+
+  @@map("projects")
+}
+
+// ============================================================================
+// EVIDENCE MODULE - PROJECT UPDATES
+// From: Project Updates CSV
+// Fields: update_id, project_id, timestamp, source_type, source_name, message
+// ============================================================================
+
+model ProjectUpdate {
+  id        String @id @default(uuid())
+  projectId String @map("project_id")
+
+  // Source identifiers (unique for idempotency)
+  updateId String @unique @map("update_id")
+
+  // Update metadata
+  timestamp  DateTime
+  sourceType String   @map("source_type") // e.g., "EMAIL", "DASHBOARD", "MEETING"
+  sourceName String   @map("source_name") // e.g., "John Smith", "Automated System"
+  message    String // The actual update message
+
+  // Metadata
+  importedAt DateTime @default(now()) @map("imported_at")
+
+  // Relationships
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([timestamp])
+  @@index([sourceType])
+  @@map("project_updates")
+}
+
+// ============================================================================
+// EVIDENCE MODULE - PRODUCTION DATA
+// From: Production Data JSON
+// Fields: generated_at, source_record_id, project_id, source_system,
+//         record_type, timestamp, payload (JSON - structure varies by record_type)
+// ============================================================================
+
+model ProductionRecord {
+  id        String @id @default(uuid())
+  projectId String @map("project_id")
+
+  // Source identifiers (unique for idempotency)
+  sourceRecordId String @map("source_record_id")
+
+  // Production data metadata
+  generatedAt  DateTime   @map("generated_at")
+  sourceSystem String     @map("source_system") // e.g., "JIRA", "JENKINS", "MONITORING"
+  recordType   RecordType @map("record_type") // DEPLOYMENT, INCIDENT, PERFORMANCE, etc
+  timestamp    DateTime
+
+  // Polymorphic payload
+  // Structure varies by recordType: 
+  // DEPLOYMENT: {version, environment, status, duration_mins, ...}
+  // INCIDENT: {severity, status, resolution_time_mins, ...}
+  // PERFORMANCE: {response_time_ms, error_rate_pct, throughput_rps, ...}
+  // OPERATIONAL: {...custom fields...}
+  payload Json @map("payload")
+
+  // Metadata
+  importedAt DateTime @default(now()) @map("imported_at")
+
+  // Relationships
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceRecordId])
+  @@index([projectId])
+  @@index([timestamp])
+  @@index([recordType])
+  @@index([sourceSystem])
+  @@map("production_records")
+}
+
+// ============================================================================
+// IMPORTS MODULE
+// Track import batches for idempotency and auditing
+// ============================================================================
+
+model ImportBatch {
+  id String @id @default(uuid())
+
+  // Batch details
+  batchName String? @map("batch_name")
+  fileName  String  @map("file_name")
+  // Repeated uploads should remain auditable; source IDs provide row-level idempotency.
+  fileHash  String  @map("file_hash")
+
+  // Processing
+  status ImportStatus @default(PROCESSING)
+
+  // Results
+  recordsProcessed Int @default(0) @map("records_processed")
+  recordsImported  Int @default(0) @map("records_imported")
+  recordsSkipped   Int @default(0) @map("records_skipped")
+  recordsFailed    Int @default(0) @map("records_failed")
+
+  // Error tracking
+  errorMessage String? @map("error_message")
+  errorDetails Json?   @map("error_details")
+
+  // Timestamps
+  createdAt   DateTime  @default(now()) @map("created_at")
+  startedAt   DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([fileHash])
+  @@map("import_batches")
+}
+
+// ============================================================================
+// INTELLIGENCE MODULE - ASSESSMENTS
+// Store historical assessments with as_of_date for time-series analysis
+// ============================================================================
+
+model ProjectAssessment {
+  id        String @id @default(uuid())
+  projectId String @map("project_id")
+
+  // Assessment point in time
+  asOfDate       DateTime @map("as_of_date") // When this assessment is valid for
+  assessmentDate DateTime @default(now()) @map("assessment_date") // When assessment was created
+
+  // Health dimensions
+  scheduleHealth    HealthStatus @map("schedule_health")
+  progressHealth    HealthStatus @map("progress_health")
+  operationalHealth HealthStatus @map("operational_health")
+  evidenceHealth    HealthStatus @map("evidence_health") // Data completeness/freshness
+  dataQuality       HealthStatus @map("data_quality") // Assessment confidence
+
+  // Aggregate
+  overallStatus     HealthStatus @map("overall_status")
+  requiresAttention Boolean      @default(false) @map("requires_attention")
+
+  // Explainability
+  confidenceLevel Confidence @map("confidence_level")
+  summary         String? // Executive summary
+
+  // Metadata
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relationships
+  project  Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  findings ProjectFinding[]
+
+  @@unique([projectId, asOfDate])
+  @@index([asOfDate])
+  @@index([overallStatus])
+  @@map("project_assessments")
+}
+
+// ============================================================================
+// INTELLIGENCE MODULE - FINDINGS
+// Individual issues/observations with evidence references
+// ============================================================================
+
+model ProjectFinding {
+  id           String @id @default(uuid())
+  assessmentId String @map("assessment_id")
+
+  // Finding details
+  category    String // e.g., SCHEDULE, PROGRESS, OPERATIONAL, DATA_QUALITY
+  title       String
+  description String
+  severity    Severity
+  confidence  Confidence
+
+  // Evidence references (link back to sources)
+  evidenceUpdateIds String[] @map("evidence_update_ids") // From ProjectUpdate
+  evidenceRecordIds String[] @map("evidence_record_ids") // From ProductionRecord (sourceRecordId)
+
+  // Explanation (explainability)
+  reasoning String // Why this finding exists
+  impact    String? // Business impact
+
+  // Recommended action
+  recommendedAction String? @map("recommended_action")
+
+  // Metadata
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relationships
+  assessment ProjectAssessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  followUps  FollowUp[]
+
+  @@index([assessmentId])
+  @@index([severity])
+  @@index([confidence])
+  @@map("project_findings")
+}
+
+// ============================================================================
+// FOLLOW-UPS MODULE
+// Action items with status tracking
+// ============================================================================
+
+model FollowUp {
+  id        String  @id @default(uuid())
+  projectId String  @map("project_id")
+  findingId String? @map("finding_id")
+
+  // Follow-up details
+  title       String
+  description String
+  owner       String? // Person responsible
+
+  // Status & priority
+  status FollowUpStatus @default(OPEN)
+
+  // Dates
+  dueDate   DateTime? @map("due_date")
+  createdAt DateTime  @default(now()) @map("created_at")
+  closedAt  DateTime? @map("closed_at")
+
+  // Metadata
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relationships
+  project Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  finding ProjectFinding?   @relation(fields: [findingId], references: [id], onDelete: SetNull)
+  history FollowUpHistory[]
+
+  @@index([projectId])
+  @@index([status])
+  @@index([dueDate])
+  @@index([owner])
+  @@map("follow_ups")
+}
+
+// ============================================================================
+// FOLLOW-UPS MODULE - HISTORY
+// Track status changes for audit trail
+// Important: RESOLVED status does NOT mean operational problem is solved
+// ============================================================================
+
+model FollowUpHistory {
+  id         String @id @default(uuid())
+  followUpId String @map("follow_up_id")
+
+  // Status change
+  fromStatus FollowUpStatus @map("from_status")
+  toStatus   FollowUpStatus @map("to_status")
+  changedAt  DateTime       @default(now()) @map("changed_at")
+
+  // Who/why
+  changedBy String? @map("changed_by")
+  notes     String? // Reason for change
+
+  // Relationships
+  followUp FollowUp @relation(fields: [followUpId], references: [id], onDelete: Cascade)
+
+  @@index([followUpId])
+  @@index([changedAt])
+  @@map("follow_up_history")
+}
